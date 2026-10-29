@@ -1,5 +1,9 @@
 # SuperMimic 复现与 Isaac Lab 接入实施指导方案
 
+**G1 接入修订（2026-10-28）**：第 14 节结合本仓库新增宇树代码与论文附录，冻结当前 G1 接口、任务差异、运行命令和验证边界。与前文建议目录不同的实际路径以第 14 节为准。
+
+**收敛实验修订**：重新核对论文第 16 页 Table A.6 下方文字，Table A.2 的奖励项也乘 dt=.02。当前 G1 TaskSpec 已由 v1 升为 v2，统一真实/想象奖励的时间尺度；v1 短测记录保留为历史证据，其回报不能与 v2 直接比较。正式训练使用新目录。新增 `single_motion` 配置和前 100 次 update 的模型预热，参数及命令见 README 的“单动作收敛实验”，均属尚待长期验证的工程配置。
+
 > 版本：2026-10-28。本文面向先复现训练逻辑、再接入 Isaac Lab 的实现路线。标记 **[论文]** 表示可在 SuperMimic 论文中直接找到的设定；**[建议]** 表示为工程实现、调试或跨仿真器迁移提出的设计，不能当作论文原始实现。所有张量维度、单位、坐标系和奖励时序都应以实际任务配置为准。
 
 ## 1. 目标与边界
@@ -249,6 +253,133 @@ Isaac Lab 的环境包装原则见[官方文档](https://isaac-sim.github.io/Isa
 3. 确定哪些奖励/观测/终止头使用解析公式，哪些需要监督学习；写明可微性和单位。
 4. 固定终止、时间截断、自动 reset 的处理与回放窗口规则。
 5. 先跑通 toy 环境和梯度测试，再连接 Isaac Lab 的真实仿真数据。
+
+## 14. 宇树官方 Mimic → G1 Isaac Lab 的实际接入
+
+### 14.1 已核对的基线与论文差异
+
+本节以本仓库 `source/unitree_rl_lab` 为基线，而不是推断外部最新版行为。重点检查了 `tasks/mimic/mdp/{commands,rewards,terminations,events}.py`、两套 G1 任务配置、G1 资产与 `scripts/mimic/csv_to_npz.py`。
+
+论文依据：[SuperMimic v1，Appendix A、C、D，Tables A.1–A.5](https://arxiv.org/pdf/2610.28480)。下表中的工程编码、平滑和仿真适配不是论文公开源码。
+
+| 项目 | 新增宇树代码的实际实现 | 当前 SuperMimic G1 配置 |
+| --- | --- | --- |
+| actor 输入 | 当前关节参考、torso 相对方向和单帧本体量 | 93 维本体观测 × 10 帧；未来参考 10 帧独立编码 |
+| 根部定义 | `torso_link` anchor | `pelvis` root，观测中的角速度与重力也使用 pelvis 坐标系 |
+| 跟踪项 | anchor 位姿、相对 body 位姿、全局 body 速度 | 保留六项跟踪，调用共享 PyTorch 数学定义 |
+| 正则 | 加速度、力矩、动作变化、关节限位和非期望接触 | 仅动作变化 −0.1、关节限位 −2；删除其余项 |
+| 失败条件 | anchor 高度、倾斜、手脚高度偏差 | root 高度误差 > 0.25 m，或 root 重力 z 分量误差 > 0.8；删除手脚终止 |
+| 速度推扰 | 每 1–3 秒直接改 root 速度 | 关闭，避免未记录的动力学跳变 |
+| 材质 | 每 shape 的静/动摩擦和 restitution 独立采样 | 同一机器人统一 μ，静/动相同，restitution=0；实际值读回 context |
+| 片段末端 | `MotionCommand` 内重采样并直接写 root/joint state | 显式 `motion_end` timeout，在环境 reset 中处理 |
+| reset 起点 | 失败计数自适应采样 | 初版采用均匀采样，明确尚未实现论文的 return-based 混合采样 |
+
+控制周期沿用官方 `sim.dt=0.005`、`decimation=4`，即 50 Hz。低增益 PD 与逐关节动作缩放直接沿用 `UNITREE_G1_29DOF_MIMIC_CFG`，不把归一化动作误当作关节力矩。
+
+### 14.2 已实现的文件与职责
+
+| 路径 | 职责 |
+| --- | --- |
+| `supermimic/tasks/g1.py` | 状态/参考编码、四元数、干净观测、逐维噪声、奖励与软/硬终止；纯 PyTorch，无 Isaac 导入 |
+| `supermimic/models/g1_world_model.py` | 带尺度的残差动力学、四元数归一化、上一动作精确推进、解析任务头 |
+| `supermimic/envs/isaaclab_adapter.py` | 物理状态与实际 DR 读取、终止前捕获、历史/reset、运行时一致性检查 |
+| `source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/supermimic/` | 独立 Gym 注册、G1 配置、命令推进及 Isaac Lab callbacks |
+| `supermimic/configs/g1.py` | `debug` 实用配置和 `paper` 网络/批量参考配置 |
+| `scripts/supermimic/train.py` | AppLauncher 启动、任务装配、日志、检查点、真实仿真检查入口 |
+| `supermimic/utils/logger.py` | 参考 RSL-RL 的控制台摘要、TensorBoard/JSONL、跨批次 episode 统计与日志状态恢复 |
+
+新任务 ID：`Unitree-G1-29dof-SuperMimic-Dance-102`、`Unitree-G1-29dof-SuperMimic-Gangnam-Style`。原 PPO 任务继续作为基线。
+
+### 14.3 G1 张量与单位契约
+
+当前两套官方配置跟踪 14 个 body，首个为 pelvis，动作/关节顺序使用实际 articulation 顺序，**不能使用 SDK 顺序直接写模型张量**。
+
+| 字段 | 布局/维度 | 来源与含义 |
+| --- | --- | --- |
+| state | 298 | q(29)、qd(29)、上一步动作(29)、再前一步动作(29)、14 body 的 position(42)/quaternion(56)/linear velocity(42)/angular velocity(42) |
+| position / velocity | m、m/s、rad/s | position 减去 env origin；速度保持世界坐标；body 字段按官方 `body_*_w` 语义，包括其质心速度定义 |
+| quaternion | wxyz，单位长度 | 编码统一正标量部符号；模型每步重归一化 |
+| clean observation | 93 | q−q0(29)、qd(29)、pelvis 角速度(3)、pelvis 投影重力(3)、上一步动作(29) |
+| observation history | `[B,10,93]` | 由适配器维护；reset 用新 episode 初帧重复填充 |
+| reference frame | 240 | 参考 q(29)、qd(29)，以及相同 14 body 的完整参考运动学量(182) |
+| goal | `[B,2400]` | 当前帧起 10 帧的参考拼接；超出末端时 hold 最后一帧；实际环境通过片段末端 timeout 重置 |
+| context | 33 | 实际 μ(1)、实际默认关节位置相对 nominal 的偏移(29)、实际 torso local COM position(3) |
+
+上述 state 与 reference 的完整字段布局是 **[工程选择]**。论文没有给出这两个张量的逐项编码。当前模型联合预测物理关节态与跟踪 body 运动学量，存在冗余；它们用于模型监督和奖励，不能宣称每次预测都满足精确刚体运动学约束。后续可用可微 FK 替代冗余 body 预测，但必须重新验证梯度和多步误差。
+
+世界模型预测 q、qd、body 运动学；两段动作历史通过精确移位写入。观测和奖励均为解析头。状态损失按固定特征尺度计算（qd/10、body linear velocity/5、angular velocity/10，其余不缩放），这是量纲处理的工程偏离。`replay_state_mse_*` 仍记录原始混合单位误差；G1 另记录 `replay_normalized_state_mse_*`，与归一化模型损失区分。
+
+传感噪声按逐项均匀分布采样，上一动作不加噪。actor 不接收 context 或真实 body 状态。参考目标是预先给定的数据；当前参考编码含环境局部世界坐标的参考位姿，尚未声称与论文未公开的目标编码完全相同。
+
+### 14.4 时序：防止自动 reset 与参考重采样污染
+
+本机 Isaac Lab 的 `ManagerBasedRLEnv.step` 顺序已读取核对：physics → termination → reward → reset → command update → interval event → observation。
+
+1. 在 t 时刻记录物理状态、带噪历史、当前参考 `frame_id=t_ref`。
+2. 执行加探索噪声并限幅的归一化动作；动作项按官方 scale/offset 变为 PD setpoint。
+3. 自定义 reward callback 在 reset 前克隆真实 `s_(t+1)`、实际 action、旧 reference frame 和终止标签。
+4. 真实 reward 与模型 reward 都用 `s_(t+1), a_t, g_t`。`RewardManager` 会乘 dt，因此 callback 返回共享奖励/dt，让采集和想象均采用每控制步奖励尺度。
+5. 适配器分别构建 `EnvStep.terminal` 与 `current`。仅后者的 done 环境重建历史并递增 episode ID。
+6. `motion_end` 作为时间截断，不作为失败监督；command 更新不再在没有 done 的情况下跨片段改写机器人状态。
+
+每一步都检查共享 reward 与环境输出一致、捕获的终止标签与环境返回一致。缺少捕获钩子会直接报错，禁止将 reset 状态写成旧 episode 的 next_state。
+
+Replay 不保存重复的 2400 维 reference goal，而是通过 frame_id 从固定运动库重建。连续窗口检查使用相邻边界的前缀和，避免构造 `[capacity,8,num_envs,context_dim]` 大张量。运动文件 SHA256、关节/body 顺序、动作 scale、TaskSpec 和配置随运行保存；更新后的转换器也记录 NPZ joint/body 顺序，旧 NPZ 会提示顺序未经元数据核验。
+
+### 14.5 配置与明确偏离
+
+`debug` 面向 16 GB 显卡：默认 64 个环境、128 个 vector steps replay、小型网络、每次策略更新先拟合 2 个模型 batch。先用 4–16 环境验证，再逐步扩展。
+
+`paper` 提供附录中的网络宽度、32 维 tanh latent、10 个模型 batch、相应批量、actor Adam β=(0.9,0.95)、两级梯度裁剪和 cosine 学习率选项。**它是规模参考配置，不是完整论文复现开关**：当前每 iteration 采集 16 步并做一次策略更新，尚未把附录 update-to-data=0.4 的具体调度口径对齐；CLI 默认环境数和训练轮数也面向调试。不要直接在 16 GB 显卡上启用论文批量。
+
+其他明确偏离：使用 Isaac Lab/PhysX；单 motion/run；startup DR 在 actor 生命周期固定，摩擦为 64 桶近似而非连续采样；均匀 reset 起点；工程 state/reference 编码与特征尺度；actor 输出 tanh 后限幅；软终止用高度误差宽度 0.02 m、tilt 误差宽度 0.05 的 sigmoid 并集；参考末端 padding。没有实现论文多运动返回率采样、多接口联合训练、多 GPU 和大规模基准评估。
+
+### 14.6 启动与验收
+
+在已经安装 Isaac Lab / Isaac Sim 的 Python 环境运行。训练脚本优先导入本仓库中的 `unitree_rl_lab`，无须先安装其 editable 包。资产默认沿用已有路径；其他机器可设置 `UNITREE_ROS_DIR`，训练还可用 `--robot-urdf` 显式覆盖。USD 转换缓存默认写 `/tmp/supermimic-isaac-assets`。
+
+先转换参考（完整 CSV，不是 60 Hz 原始帧直接充当 50 Hz 控制参考）：
+
+```bash
+python scripts/mimic/csv_to_npz.py \
+  --input_file source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/G1_Take_102.bvh_60hz.csv \
+  --input_fps 60 --output_fps 50 --output_name /home/yi/aaai/supermimic/supermimic-rl/datasets/g1_dance_50hz.npz \
+  --convert-only --headless --device cuda:0
+```
+
+先关闭 DR/noise，并用 0.24 s 时间限制主动触发 reset：
+
+```bash
+python scripts/supermimic/train.py --motion-file /home/yi/aaai/supermimic/supermimic-rl/datasets/g1_dance_50hz.npz \
+  --num-envs 4 --check-only --no-dr --no-observation-noise \
+  --episode-length-s 0.24 --log-dir runs/g1_check --headless --device cuda:0
+```
+
+随后打开默认 DR 与观测噪声训练：
+
+```bash
+python scripts/supermimic/train.py --motion-file /home/yi/aaai/supermimic/supermimic-rl/datasets/g1_dance_50hz.npz \
+  --num-envs 64 --iterations 1000 --log-dir runs/g1_train --headless --device cuda:0
+```
+
+恢复时保持任务、运动文件、seed、profile、环境数、DR/noise 参数一致，追加 `--resume latest`，或提供具体时间戳运行目录/检查点路径。每次启动在 `--log-dir` 根目录下创建新的时间戳子目录；play 先选择最新训练目录，再选择该目录里的最新检查点。保存网络、optimizer、replay 和计数器；**PhysX 不能恢复 solver/contact cache，恢复后开启新 episode**。旧 replay 保留真实历史，新数据用递增 episode_id 避免拼接。实际 context 不一致或 motion SHA 不同会拒绝加载。需要在独立环境做评估；训练 Runner 的原地可恢复评估只适用于 toy 环境。
+
+运行 `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover -s tests -v`。G1 测试覆盖共享奖励、root 终止、四元数符号、噪声幅度、参考推进、目标重建、真实终止状态协议、部分 reset 和 G1 模型 BPTT 梯度。真实 Isaac Lab 短测进一步检查 API 生命周期与实际设备。
+
+初期验收只表示“G1 真仿真采集 → 8 步模型拟合 → 32 步 actor BPTT → critic → 保存”运行正确。长期训练仍须检查真实 tracking return、失败率以及归一化 1/8/32 步模型误差，不能用想象 return 或短测的非零梯度替代策略效果验证。
+
+### 14.7 本机验证记录（2026-10-28）
+
+环境：RTX 5070 Ti 16 GB，PyTorch 2.7.0+cu128，Isaac Lab 0.54.4，Isaac Sim 5.1.0.0。参考由官方 Dance-102 CSV 的第 1–121 帧转换为 50 Hz、100 帧 NPZ，用于短测，并非整段动作评估。
+
+| 验证 | 实际执行 | 结果 |
+| --- | --- | --- |
+| 数学/接口回归 | 28 项 unittest | 全部通过，包括 G1 噪声/时序、BPTT、compact reference replay、两级裁剪、cosine schedule，以及日志统计、TensorBoard 和恢复兼容性 |
+| 强制 reset | 4 环境，关闭 DR/noise，episode 0.24 s，2 iterations | 发生 5 次 episode 结束；无奖励/终止捕获不一致；actor 梯度范数约 0.669 |
+| DR/noise | 4 环境，默认三类 startup DR 与传感噪声，4 iterations | actor 梯度范数约 1.066；归一化 1/8/32 步 replay MSE 约 0.00134/0.00499/0.02218 |
+| 实际续训 | 重新启动 Isaac Sim，加载 DR run 的网络、optimizer、replay，追加 1 iteration | 迭代数从 4 到 5；实际 context 校验通过，新 episode 正常训练 |
+
+短测日志和 checkpoint 在本机 `/tmp/supermimic-g1-{check,final,resumed}`，运动文件 `/tmp/supermimic-g1-smoke.npz`；临时产物不纳入源码。没有验证长期收敛、完整 Dance-102/Gangnam 跟踪分数、论文规模配置或真实机器人部署。
 
 ## 参考资料
 

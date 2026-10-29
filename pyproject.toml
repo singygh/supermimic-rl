@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supermimic-rl"
+version = "0.1.0"
+description = "Differentiable world-model BPTT reinforcement learning"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2"]
+
+[project.optional-dependencies]
+logging = ["tensorboard>=2.14"]
+
+[project.scripts]
+supermimic-train = "supermimic.train:main"
+
+[tool.setuptools.packages.find]
+include = ["supermimic*"]

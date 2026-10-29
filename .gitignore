@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+runs/
+build/
+dist/
+SuperMimic_复现与_Isaac_Lab_接入实施指导方案.md
